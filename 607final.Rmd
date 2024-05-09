@@ -1,0 +1,260 @@
+---
+title: "Property sales analysis"
+output: html_document
+date: "2023-11-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(RMySQL)
+library(yaml)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(infer)
+library(rvest)
+library(mongolite)
+```
+
+Establishing a connection to the sql database
+```{r}
+config <- yaml::read_yaml("config.yaml")
+con <- dbConnect(
+  RMySQL::MySQL(),
+  dbname = config$dbname,
+  host = config$host,
+  port = config$port,
+  user = config$user,
+  password =  config$password
+)
+```
+
+
+Store each table in the database in a dataframe
+```{r}
+## 2018
+query1 <- "SELECT * FROM 607final.2018_property_sales"
+property_sales_2018 <- dbGetQuery(con, query1)
+
+## 2019
+query2 <- "SELECT * FROM 607final.2019_property_sales"
+property_sales_2019 <- dbGetQuery(con, query2)
+
+## 2020
+query3 <- "SELECT * FROM 607final.2020_property_sales"
+property_sales_2020 <- dbGetQuery(con, query3)
+
+## 2022
+query4 <- "SELECT * FROM 607final.2022_property_sales"
+property_sales_2022 <- dbGetQuery(con, query4)
+```
+
+Store the 2021 csv dataframe in mongoddb atlas
+```{r}
+uri <- "mongodb+srv://bobbtilon:I8aGyfSubO4lteBf@cluster0.t25lesh.mongodb.net/cluster0?retryWrites=true&w=majority"
+conn <- mongo(collection = "final", db = "cluster0", url = uri)
+property_sales_2021 <-conn$find()
+```
+
+**If connection to mongodb doesn't work do the following and delete the above codechunk**
+```{r}
+## url <- "https://raw.githubusercontent.com/Kingtilon1/DATA607/main/Final/2021_property_sales.csv"
+## property_sales_2021 <- read.csv(url)
+```
+
+## Is there a trend in the average property sales data from 2018 to 2022?
+My hypothesis is that there will be a consistent increase throughout the years
+
+### Data transformations/cleanup
+```{r}
+names(property_sales_2022)[names(property_sales_2022) == "ï»¿PropertyID"] <- "PropertyID"
+
+clean_and_standardize <- function(df) {
+  df$Sale_price <- as.numeric(gsub("[\\$,]", "", df$Sale_price))
+  return(df)
+}
+
+
+property_sales_2020 <- clean_and_standardize(property_sales_2020)
+property_sales_2021 <- clean_and_standardize(property_sales_2021)
+```
+
+### A look at the 2018 dataframe
+The dataframe encompasses information on 886 properties, including categorical variables such as property type (PropType), address, and various descriptors like condominium projects (CondoProject), districts (District), neighborhoods (Nbhd), and architectural styles (Style). Numerical variables like tax keys (Taxkey) range from 1.002e+07 to 2.141e+09, with a mean value of approximately 1.394e+09. Notable summary statistics reveal a diversity of property characteristics, including the number of stories (Stories), year of construction (Year_Built), room count (Nr_of_rms), square footage (Fin_sqft), number of bedrooms (Bdrms), bathrooms (Fbath, Hbath), lot size (Lotsize), and sale price (Sale_price). Of particular interest, the sale price varies from a minimum of $2,000 to a maximum of $6,800,000, with a median value of $103,750, indicating a wide range of property values in the dataset.
+```{r}
+summary(property_sales_2018)
+```
+We see that the majority of sales occurred at around 15k which can account for things like apartments and condos to around 200,000 with a few outliers going to the million mark, and based off of the summary statistics, a sale at 6 million, but we limited the view from 0 to 1 million to see the distribution clearly.
+```{r}
+ggplot(property_sales_2018, aes(x = Sale_price)) +
+  geom_histogram(binwidth = 10000, fill = "green", color = "black", alpha = 0.7) +
+  scale_x_continuous(labels = scales::comma,  limits = c(0, 1000000)) + 
+  labs(title = "Distribution of Sale Prices in 2018",
+       x = "Sale Price",
+       y = "Count") +
+  theme_minimal()
+```
+
+### We will join all of the data sets using the bindrows function
+```{r}
+# Create a list of data frames
+data_frames_list <- lapply(2018:2022, function(year) {
+  df_name <- paste0("property_sales_", year)
+  get(df_name)  
+})
+
+# Function to standardize column types
+standardize_types <- function(df) {
+  # Convert all columns to character
+  df[] <- lapply(df, as.character)
+  return(df)
+}
+
+# Combine the data frames into a single data frame
+combined_df <- bind_rows(lapply(data_frames_list, standardize_types), .id = "Year")
+
+# Calculate the average sale price for each year and convert to numeric
+average_prices <- combined_df %>%
+  group_by(Year) %>%
+  summarise(avg_sale_price = mean(as.numeric(Sale_price), na.rm = TRUE))
+
+combined_df <- merge(combined_df, average_prices, by = "Year")
+
+# Create a line chart with customized x-axis labels
+ggplot(average_prices, aes(x = Year, y = avg_sale_price, color = Year, group = 1)) +
+  geom_line() +
+  ggtitle("Average Sale Prices Over Years") +
+  theme_minimal() +
+  scale_x_discrete(labels = c("2018", "2019", "2020", "2021", "2022"))
+
+
+```
+Looking at the line plot we see that from 2018 to 2019 the average price jumped from $169,411 to $258,378 dollars, a 52.61% increase, and from 2019 to 2020 ($207,131) we see a 19.9% decrease, then from 2020 to 2021($237,485) we have a  14.66% increase and then from 2021 to 2022($271,545) we have a 14.33% increase
+
+Lets use a linear regression model to explore the trend to confirm if there is an upward trend
+```{r}
+model <- lm(avg_sale_price ~ Year, data = combined_df)
+
+# Display the summary of the regression model
+summary(model)
+
+# Visualize the regression line
+ggplot(average_prices, aes(x = Year, y = avg_sale_price)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  ggtitle("Regression Line of Average Sale Prices Over Years") +
+  theme_minimal()
+```
+
+
+Here I want to showcase the location of some of these properties on Google maps using their API's. Here is the API key that I will be using. The R packages that I will be using are the tidygeocoder (This is a package developed and by Jesse Cambon) and ggmap.
+
+```{r}
+
+register_google(key = 'AIzaSyBYwHOEJV9s_I0ykfOixB7BBAw887Qo03w')
+
+api_key = 'AIzaSyBYwHOEJV9s_I0ykfOixB7BBAw887Qo03w'
+```
+
+Here I want to add some more information to the Address because I will need it in order to get the accurate longitude and latitudes 
+
+```{r}
+
+combined_df <- combined_df %>% 
+mutate("Address" = paste(Address, ", Milwaukee, WI"))
+addresses <- tibble('Address' = combined_df$Address)
+head(addresses)
+
+
+```
+
+Here I will only be using the first 100 addresses because the overall dataset is close to 32,000 observations. I will be using the tidygeocoder package in order to use the address to get the longitude and latitude.
+
+
+```{r}
+
+addresses_subset <- combined_df[1:100, "Address"]
+
+addresses <- tibble(Address = addresses_subset)
+
+lat_longs <- addresses %>%
+  mutate_geocode(location = Address, method = 'osm', output = 'latlon', provider = 'osm')
+
+head(lat_longs)
+
+```
+
+
+```{r}
+MI <- get_map(location = c(lon = mean(lat_longs$lon), lat = mean(lat_longs$lat)),
+               zoom = 13)
+
+ggmap(MI) +
+  geom_point(data = lat_longs, aes(x = lon, y = lat), color = "red", size = 1) +
+  ggtitle("Properties on Map")
+
+```
+
+
+```{r}
+MI <- get_map(location = c(lon = mean(lat_longs$lon), lat = mean(lat_longs$lat)), maptype= 'hybrid' , source="google", api_key = api_key, zoom=13)
+
+ggmap(MI) +
+  geom_point(data = lat_longs, aes(x = lon, y = lat), color = "cyan", size = 1) +
+  ggtitle("Geocoded Addresses on Map")
+```
+I want to now test commercial property between 2020 and 2021. I will be do some hypothesis testing my hypothesis will be as follows:
+
+H0 - There is no difference between the mean sale prices in year 2020 and 2021
+HA - There is a difference between the mean sale prices in year 2020 and 2021 
+
+```{r}
+
+commercial_prop<- combined_df %>% 
+  filter(PropType == 'Commercial') 
+head(commercial_prop)
+```
+
+Now I just want the sale year so that it is easier to separate these groups 
+
+```{r}
+commercial_prop2 <- commercial_prop %>% 
+  mutate("Sale_year" = str_extract(commercial_prop$Sale_date,"\\b20\\d{2}\\b" ))
+
+
+
+```
+
+
+```{r}
+com_2021 <- commercial_prop2 %>% 
+  filter(Sale_year == "2020") %>%
+  mutate(Sale_price = as.numeric(gsub("\\$|,", "", str_extract(Sale_price, "\\$\\d+"))))
+
+com_2020 <- commercial_prop2 %>% 
+  filter(Sale_year == "2021") %>% 
+  mutate(Sale_price = as.numeric(gsub("\\$|,", "", str_extract(Sale_price, "\\$\\d+"))))
+
+print(com_2020)
+
+```
+
+I will conduct an independent 
+```{r}
+t_test <- t.test(com_2021$Sale_price, com_2020$Sale_price, var.equal = TRUE)
+
+# Print the result
+cat("Two-sample independent t-test with equal variances:\n")
+print(t_test)
+
+```
+as you can see our p value is 0.9625 so this enough to reject our null hypothesis.
+
+```{r}
+ggplot(rbind(com_2020,com_2021), aes(x = Sale_year, y = Sale_price)) + 
+  geom_boxplot()
+```
+As we can see the median price of the commercial property is higher than that of 2021.
+
+## Conclusion
+In this linear regression analysis, we fitted a model to explore the relationship between the year and average sale prices. The coefficients for 'Year2', 'Year3', 'Year4', and 'Year5' were found to be highly statistically significant (p-value < 0.001), indicating an upward trend in average sale prices over the years. The high R-squared values close to 1 suggest that the model effectively explains a substantial proportion of the variance in average sale prices based on the 'Year' variable. Overall, the results provide compelling evidence for a significant and positive trend in average sale prices from 2018 to 2022, implying a consistent increase in property values over this period. This confirms my hypothessi that there 
